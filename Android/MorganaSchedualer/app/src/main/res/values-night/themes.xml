@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      This is the base theme for your app (night mode).
+      It's a "splash screen" theme that will be shown while the app loads.
+      The actual app theme is controlled by MaterialTheme in your Compose code.
+    -->
+    <style name="Theme.MorganaSchedualer" parent="Theme.SplashScreen">
+        <!-- Optional: Set the splash screen background color for night mode -->
+        <item name="windowSplashScreenBackground">#1C1B1F</item>
+        <!-- Optional: Set the splash screen icon -->
+        <!-- <item name="windowSplashScreenAnimatedIcon">@drawable/ic_launcher_foreground</item> -->
+        <!-- Optional: Set the theme to apply after the splash screen -->
+        <item name="postSplashScreenTheme">@style/Theme.MorganaSchedualer.App</item>
+    </style>
+
+    <!-- The actual theme for your app's Activity (night mode) -->
+    <style name="Theme.MorganaSchedualer.App" parent="android:Theme.Material.NoActionBar">
+        <!-- You can add other window-level attributes here if needed -->
+    </style>
+</resources>

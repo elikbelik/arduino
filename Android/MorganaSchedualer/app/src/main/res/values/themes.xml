@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      This is the base theme for your app.
+      It's a "splash screen" theme that will be shown while the app loads.
+      The actual app theme is controlled by MaterialTheme in your Compose code.
+      We inherit from "Theme.SplashScreen" to support modern Android splash screens.
+    -->
+    <style name="Theme.MorganaSchedualer" parent="Theme.SplashScreen">
+        <!-- Optional: Set the splash screen background color -->
+        <item name="windowSplashScreenBackground">#FFFFFF</item>
+        <!-- Optional: Set the splash screen icon -->
+        <!-- <item name="windowSplashScreenAnimatedIcon">@drawable/ic_launcher_foreground</item> -->
+        <!-- Optional: Set the theme to apply after the splash screen -->
+        <item name="postSplashScreenTheme">@style/Theme.MorganaSchedualer.App</item>
+    </style>
+
+    <!-- The actual theme for your app's Activity -->
+    <style name="Theme.MorganaSchedualer.App" parent="android:Theme.Material.Light.NoActionBar">
+        <!-- You can add other window-level attributes here if needed -->
+    </style>
+</resources>
