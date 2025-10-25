@@ -252,6 +252,7 @@ fun SchedulerAppWithBleControl() {
     // Internal function to handle writing commands to the characteristic
     @Suppress("MissingPermission")
     fun sendCommandInternal(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, command: String) {
+        Log.i(TAG,"📤 SENDING COMMAND: $command")
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             val writeResult = gatt.writeCharacteristic(
                 characteristic,
@@ -260,8 +261,10 @@ fun SchedulerAppWithBleControl() {
             )
             Log.d(TAG,"Writing command (API 33+): '$command', result code: $writeResult")
             if (writeResult != BluetoothStatusCodes.SUCCESS){
-                Log.e(TAG,"Failed to write characteristic (API 33+), error: $writeResult")
+                Log.e(TAG,"❌ Failed to write characteristic (API 33+), error: $writeResult")
                 // Optionally trigger disconnect or retry logic
+            } else {
+                Log.i(TAG,"✅ Command queued successfully (API 33+)")
             }
         } else {
             characteristic.value = command.toByteArray(Charsets.UTF_8)
@@ -269,8 +272,10 @@ fun SchedulerAppWithBleControl() {
             val writeSuccess = gatt.writeCharacteristic(characteristic)
             Log.d(TAG,"Writing command (Legacy): '$command', success: $writeSuccess")
             if (!writeSuccess){
-                Log.e(TAG,"Failed to write characteristic (Legacy)")
+                Log.e(TAG,"❌ Failed to write characteristic (Legacy)")
                 // Optionally trigger disconnect or retry logic
+            } else {
+                Log.i(TAG,"✅ Command queued successfully (Legacy)")
             }
         }
         // Result handled in onCharacteristicWrite callback
@@ -281,18 +286,22 @@ fun SchedulerAppWithBleControl() {
         val g = gatt ?: return // Safety check
         val char = characteristic ?: return
 
-        // 1. Send time sync
-        val timeSyncCmd = """{"cmd":"time_sync","time":${System.currentTimeMillis() / 1000}}"""
-        Log.d(TAG, "Sending Time Sync command...")
-        sendCommandInternal(g, char, timeSyncCmd)
-
-        // Add a small delay between commands if needed by the peripheral
+        Log.i(TAG, "🔄 Starting initial sync sequence...")
         scope.launch {
-            delay(200) // Small delay
+            // 1. Send time sync
+            val timeSyncCmd = """{"cmd":"time_sync","time":${System.currentTimeMillis() / 1000}}"""
+            Log.i(TAG, "🕐 Step 1/2: Sending Time Sync command...")
+            sendCommandInternal(g, char, timeSyncCmd)
+
+            // Wait for the write to complete before sending next command
+            Log.d(TAG, "⏳ Waiting 500ms before sending next command...")
+            delay(500) // Increased delay to ensure first command completes
+            
             // 2. Request schedules
             val getSchedulesCmd = """{"cmd":"get_schedules"}"""
-            Log.d(TAG, "Sending Get Schedules command...")
+            Log.i(TAG, "📋 Step 2/2: Sending Get Schedules command...")
             sendCommandInternal(g, char, getSchedulesCmd)
+            Log.i(TAG, "⏳ Waiting for schedule data from ESP32...")
             // Schedule list will arrive via notification (onCharacteristicChanged)
         }
     }
@@ -300,31 +309,46 @@ fun SchedulerAppWithBleControl() {
     // --- Parsing Logic ---
     fun parseAndLoadSchedules(jsonString: String, scheduleList: MutableList<ScheduleTask>) {
         try {
+            Log.d(TAG, "🔄 Parsing schedules from JSON...")
+            Log.d(TAG, "   JSON length: ${jsonString.length} characters")
+            
+            // Check if JSON is complete (should start with '[' and end with ']')
+            if (!jsonString.startsWith("[") || !jsonString.endsWith("]")) {
+                Log.e(TAG, "❌ JSON appears truncated! Start: ${jsonString.startsWith("[")} End: ${jsonString.endsWith("]")}")
+                Log.e(TAG, "   This usually means MTU is too small. Check MTU negotiation logs.")
+                return
+            }
+            
             // ESP32 sends the schedules as a direct JSON array
             val jsonArray = JSONArray(jsonString)
             val tempList = mutableListOf<ScheduleTask>()
             for (i in 0 until jsonArray.length()) {
                 val taskObject = jsonArray.getJSONObject(i)
-                tempList.add(
-                    ScheduleTask(
-                        id = taskObject.getString("id"),
-                        title = taskObject.getString("title"),
-                        port = taskObject.getInt("port"),
-                        startTime = taskObject.getString("start"),
-                        endTime = taskObject.getString("end"),
-                        isActive = taskObject.getBoolean("active"),
-                        alwaysActive = taskObject.getBoolean("alwaysOn")
-                    )
+                val task = ScheduleTask(
+                    id = taskObject.getString("id"),
+                    title = taskObject.getString("title"),
+                    port = taskObject.getInt("port"),
+                    startTime = taskObject.getString("start"),
+                    endTime = taskObject.getString("end"),
+                    isActive = taskObject.getBoolean("active"),
+                    alwaysActive = taskObject.getBoolean("alwaysOn")
                 )
+                tempList.add(task)
+                Log.d(TAG, "   ✅ Parsed task #$i: ${task.title} (Port ${task.port})")
             }
-            Log.d(TAG, "Successfully parsed ${tempList.size} schedules.")
+            Log.i(TAG, "✅ Successfully parsed ${tempList.size} schedules from ESP32")
             // Update the Compose state list on the main thread
             scope.launch {
                 scheduleList.clear()
                 scheduleList.addAll(tempList)
+                Log.i(TAG, "✅ UI updated with ${scheduleList.size} tasks")
             }
+        } catch (e: org.json.JSONException) {
+            Log.e(TAG, "❌ JSON parsing error - data may be truncated due to MTU limits", e)
+            Log.e(TAG, "   Received JSON (first 100 chars): ${jsonString.take(100)}")
+            Log.e(TAG, "   Full length: ${jsonString.length} chars")
         } catch (e: Exception) {
-            Log.e(TAG, "Error parsing schedule JSON: $jsonString", e)
+            Log.e(TAG, "❌ Error parsing schedule JSON", e)
         }
     }
 
@@ -338,11 +362,19 @@ fun SchedulerAppWithBleControl() {
                     if (status == BluetoothGatt.GATT_SUCCESS) {
                         when (newState) {
                             BluetoothProfile.STATE_CONNECTED -> {
-                                connectionState = "Discovering Services..."
+                                connectionState = "Negotiating MTU..."
                                 bluetoothGatt = gatt
-                                // Wait a bit before discovering services (recommended)
-                                delay(600)
-                                gatt?.discoverServices()
+                                // Request larger MTU to handle larger JSON payloads
+                                Log.i(TAG, "🔧 Requesting MTU of 517 bytes...")
+                                val mtuRequested = gatt?.requestMtu(517) // 512 bytes payload + 5 bytes overhead
+                                if (mtuRequested == true) {
+                                    Log.d(TAG, "MTU request initiated successfully")
+                                } else {
+                                    Log.e(TAG, "Failed to initiate MTU request")
+                                    // Fall back to service discovery if MTU request fails
+                                    delay(600)
+                                    gatt?.discoverServices()
+                                }
                             }
                             BluetoothProfile.STATE_DISCONNECTED -> {
                                 connectionState = "Disconnected"
@@ -358,6 +390,26 @@ fun SchedulerAppWithBleControl() {
                         connectionState = "Error"
                         gatt?.close()
                         bluetoothGatt = null
+                    }
+                }
+            }
+
+            // Handle MTU change callback
+            @Suppress("MissingPermission")
+            override fun onMtuChanged(gatt: BluetoothGatt?, mtu: Int, status: Int) {
+                scope.launch {
+                    if (status == BluetoothGatt.GATT_SUCCESS) {
+                        Log.i(TAG, "✅ MTU changed successfully to $mtu bytes")
+                        connectionState = "Discovering Services..."
+                        // Now proceed with service discovery
+                        delay(600)
+                        gatt?.discoverServices()
+                    } else {
+                        Log.e(TAG, "❌ MTU change failed with status: $status")
+                        connectionState = "Discovering Services..."
+                        // Still try service discovery with default MTU
+                        delay(600)
+                        gatt?.discoverServices()
                     }
                 }
             }
@@ -400,9 +452,9 @@ fun SchedulerAppWithBleControl() {
             // Handle result of characteristic write
             override fun onCharacteristicWrite(gatt: BluetoothGatt?, characteristic: BluetoothGattCharacteristic?, status: Int) {
                 if (status == BluetoothGatt.GATT_SUCCESS) {
-                    Log.d(TAG, "Characteristic write successful: ${characteristic?.uuid}")
+                    Log.i(TAG, "✅ Characteristic write COMPLETED successfully: ${characteristic?.uuid}")
                 } else {
-                    Log.e(TAG, "Characteristic write failed: ${characteristic?.uuid}, Status: $status")
+                    Log.e(TAG, "❌ Characteristic write FAILED: ${characteristic?.uuid}, Status: $status")
                 }
             }
 
@@ -411,7 +463,9 @@ fun SchedulerAppWithBleControl() {
                 scope.launch {
                     if (characteristic.uuid == CHARACTERISTIC_UUID) {
                         val receivedJson = String(value, Charsets.UTF_8)
-                        Log.i(TAG, "Received Data: $receivedJson")
+                        Log.i(TAG, "📥 RECEIVED DATA from ESP32:")
+                        Log.i(TAG, "   Length: ${receivedJson.length} bytes")
+                        Log.i(TAG, "   Content: $receivedJson")
                         parseAndLoadSchedules(receivedJson, schedules)
                     }
                 }

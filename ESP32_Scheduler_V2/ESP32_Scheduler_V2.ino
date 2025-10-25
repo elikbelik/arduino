@@ -62,6 +62,7 @@ class MyServerCallbacks: public BLEServerCallbacks {
     Serial.println(">>> BLE DEVICE CONNECTED <<<");
     Serial.print(">>> Current taskCount: ");
     Serial.println(taskCount);
+    Serial.println(">>> MTU: 517 bytes configured for large transfers");
     Serial.println(">>> Waiting for commands from app...");
     Serial.println("===========================================");
   }
@@ -464,6 +465,11 @@ void setup() {
   // Initialize BLE
   Serial.println(">>> Initializing BLE...");
   BLEDevice::init("ESP32 Scheduler");
+  
+  // Set MTU size (must be done before creating server)
+  BLEDevice::setMTU(517); // Set maximum MTU to match Android request
+  Serial.println(">>> MTU set to 517 bytes for large data transfers");
+  
   BLEServer *pServer = BLEDevice::createServer();
   pServer->setCallbacks(new MyServerCallbacks());
   BLEService *pService = pServer->createService(SERVICE_UUID);
