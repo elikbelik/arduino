@@ -69,7 +69,6 @@ class MyServerCallbacks: public BLEServerCallbacks {
 
   void onDisconnect(BLEServer* pServer) {
     deviceConnected = false;
-    timeIsSet = false; // Require a new time sync on reconnect
     Serial.println("===========================================");
     Serial.println(">>> BLE DEVICE DISCONNECTED <<<");
     Serial.println(">>> Restarting advertising...");
@@ -113,9 +112,27 @@ class MyCallbacks: public BLECharacteristicCallbacks {
     // --- Command Router ---
     if (strcmp(cmd, "time_sync") == 0) {
       // 1. Time Sync Command
-      // {"cmd":"time_sync","time":1678886400}
+      // {"cmd":"time_sync","time":1678886400,"offset":10800}
       long unixTime = doc["time"];
+      long timezoneOffset = doc["offset"]; // timezone offset in seconds
       if (unixTime > 0) {
+        // Configure timezone first
+        if (doc.containsKey("offset")) {
+          // Set timezone using offset in seconds
+          char tzString[32];
+          int offsetHours = timezoneOffset / 3600;
+          int offsetMins = abs(timezoneOffset % 3600) / 60;
+          
+          // TZ format: "UTC<offset>" where offset is negative for east of UTC
+          // For example: UTC-3 means UTC+3 hours
+          sprintf(tzString, "UTC%d:%02d", -offsetHours, offsetMins);
+          setenv("TZ", tzString, 1);
+          tzset();
+          Serial.print("Timezone configured: ");
+          Serial.println(tzString);
+        }
+        
+        // Set the time
         timeval tv;
         tv.tv_sec = unixTime;
         tv.tv_usec = 0;
@@ -378,6 +395,7 @@ void loadSchedules() {
 void checkSchedules() {
   if (!timeIsSet) {
     // Don't do anything if time hasn't been synced
+    // Serial.print("."); // Uncomment for very noisy logging
     return;
   }
 
@@ -511,11 +529,10 @@ void setup() {
 void loop() {
   // The main loop is now non-blocking!
   // This loop runs thousands of times per second.
-  
-  if (deviceConnected && timeIsSet) {
-    // Only check schedules if a device is connected and time is synced
-    checkSchedules();
-  }
+
+  // Always check the schedules, regardless of connection.
+  // The function itself will check if time is set.
+  checkSchedules();
 
   // A small delay is CRITICAL to prevent the watchdog timer from
   // resetting the chip, especially when no device is connected.

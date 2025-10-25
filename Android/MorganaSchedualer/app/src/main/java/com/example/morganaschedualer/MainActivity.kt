@@ -288,9 +288,16 @@ fun SchedulerAppWithBleControl() {
 
         Log.i(TAG, "🔄 Starting initial sync sequence...")
         scope.launch {
-            // 1. Send time sync
-            val timeSyncCmd = """{"cmd":"time_sync","time":${System.currentTimeMillis() / 1000}}"""
-            Log.i(TAG, "🕐 Step 1/2: Sending Time Sync command...")
+            // 1. Send time sync with timezone offset
+            val timezoneOffset = TimeZone.getDefault().rawOffset / 1000 // offset in seconds
+            val dstOffset = if (TimeZone.getDefault().inDaylightTime(Date())) {
+                TimeZone.getDefault().dstSavings / 1000
+            } else {
+                0
+            }
+            val totalOffset = timezoneOffset + dstOffset
+            val timeSyncCmd = """{"cmd":"time_sync","time":${System.currentTimeMillis() / 1000},"offset":$totalOffset}"""
+            Log.i(TAG, "🕐 Step 1/2: Sending Time Sync command (offset: $totalOffset seconds)...")
             sendCommandInternal(g, char, timeSyncCmd)
 
             // Wait for the write to complete before sending next command
