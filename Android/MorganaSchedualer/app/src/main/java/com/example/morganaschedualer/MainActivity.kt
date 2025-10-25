@@ -4,8 +4,10 @@ import android.Manifest
 import android.app.TimePickerDialog
 import android.os.Build
 import android.os.Bundle
+import android.util.Log // Log import
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.compose.foundation.clickable // Import for clickable modifier
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -14,12 +16,16 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material3.*
-import androidx.compose.material3.ExperimentalMaterial3Api // <-- ADD THIS LINE
+import androidx.compose.material3.ExperimentalMaterial3Api // Opt-in import
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+// Imports for KeyboardOptions and KeyboardType
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextAlign // Import for Text alignment
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import java.util.UUID
@@ -29,13 +35,18 @@ import kotlinx.coroutines.launch
 import com.google.accompanist.permissions.ExperimentalPermissionsApi
 import com.google.accompanist.permissions.rememberMultiplePermissionsState
 
-// --- Data Model for a Schedule Task ---
+// --- Log Tag ---
+private const val TAG = "MorganaApp"
+
+// --- Data Model for a Schedule Task (UPDATED) ---
 data class ScheduleTask(
     val id: String = UUID.randomUUID().toString(),
+    val title: String, // Added Title
     val port: Int,
     val startTime: String,
     val endTime: String,
-    val isActive: Boolean
+    val isActive: Boolean,
+    val alwaysActive: Boolean // Added Always Active flag
 )
 
 class MainActivity : ComponentActivity() {
@@ -45,7 +56,6 @@ class MainActivity : ComponentActivity() {
             MaterialTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
                     RequestBluetoothPermissions {
-                        // Call the correct app function
                         SchedulerApp()
                     }
                 }
@@ -63,30 +73,34 @@ fun SchedulerApp() {
     val schedules = remember { mutableStateListOf<ScheduleTask>() }
     var showDialog by remember { mutableStateOf(false) }
     var taskToEdit by remember { mutableStateOf<ScheduleTask?>(null) }
-    val scope = rememberCoroutineScope() // Correct way to get a coroutine scope in Compose
+    val scope = rememberCoroutineScope()
 
-    // --- MOCK BLE FUNCTIONS (for UI demonstration) ---
-    // Replace these with your actual BLE communication logic
+    // --- MOCK BLE FUNCTIONS (Updated for new data model) ---
     fun syncAndFetchSchedulesFromEsp() {
-        // 1. Send time sync command to ESP
-        // 2. Send "get_schedules" command
-        // 3. Listen for response and parse it
-        // 4. Update the 'schedules' list
-        println("Simulating fetching data from ESP...")
+        Log.d(TAG,"Simulating fetching data from ESP...") // Use Log.d
         connectionState = "Connected"
-        // Example response
+
+        // Mock sending time sync and get schedules (using new command protocol structure)
+        val timeSyncCmd = """{"cmd":"time_sync","time":${System.currentTimeMillis() / 1000}}"""
+        Log.d(TAG, "Mock Send: $timeSyncCmd") // Log mock command
+        val getSchedulesCmd = """{"cmd":"get_schedules"}"""
+        Log.d(TAG, "Mock Send: $getSchedulesCmd") // Log mock command
+
+        // Mock receiving the list (Updated data structure)
+        Log.d(TAG, "Mock receiving schedule list...")
         schedules.clear()
         schedules.addAll(listOf(
-            ScheduleTask(port = 26, startTime = "09:00", endTime = "12:30", isActive = true),
-            ScheduleTask(port = 27, startTime = "18:00", endTime = "22:00", isActive = false)
+            ScheduleTask(id = "uuid-1", title = "Water Pump", port = 26, startTime = "09:00", endTime = "12:30", isActive = true, alwaysActive = false),
+            ScheduleTask(id = "uuid-2", title = "Night Light", port = 27, startTime = "18:00", endTime = "22:00", isActive = true, alwaysActive = true),
+            ScheduleTask(id = "uuid-3", title = "Fan", port = 25, startTime = "10:00", endTime = "16:00", isActive = false, alwaysActive = false)
         ))
     }
 
-    fun updateSchedulesOnEsp(updatedList: List<ScheduleTask>) {
-        // 1. Convert updatedList to JSON string
-        // 2. Send "set_schedules" command with the JSON payload
-        println("Simulating sending updated list to ESP...")
-        println(updatedList)
+    // Mock function to simulate sending updates (updated structure)
+    // In a real app, this would send specific add/update/delete commands
+    fun sendCommandToEsp(commandJson: String) {
+        Log.d(TAG, "Mock Sending Command: $commandJson")
+        // In real app: bleManager.sendCommand(commandJson)
     }
 
 
@@ -106,7 +120,7 @@ fun SchedulerApp() {
         floatingActionButton = {
             if (connectionState == "Connected") {
                 FloatingActionButton(onClick = {
-                    taskToEdit = null
+                    taskToEdit = null // Clear edit state for adding new task
                     showDialog = true
                 }) {
                     Icon(Icons.Default.Add, contentDescription = "Add Task")
@@ -118,9 +132,8 @@ fun SchedulerApp() {
             if (connectionState != "Connected") {
                 DisconnectedView(onConnect = {
                     connectionState = "Connecting..."
-                    // Simulate delay for connection
-                    scope.launch { // Use the Composable's scope
-                        delay(1500) // Import kotlinx.coroutines.delay
+                    scope.launch {
+                        delay(1500)
                         syncAndFetchSchedulesFromEsp()
                     }
                 })
@@ -128,38 +141,55 @@ fun SchedulerApp() {
                 ScheduleListView(
                     schedules = schedules,
                     onToggle = { task ->
+                        val updatedTask = task.copy(isActive = !task.isActive)
+                        Log.d(TAG, "Toggling task: $updatedTask")
+                        // In mock mode, update locally. Real app waits for ESP response.
                         val index = schedules.indexOf(task)
-                        if (index != -1) {
-                            schedules[index] = task.copy(isActive = !task.isActive)
-                            updateSchedulesOnEsp(schedules.toList())
-                        }
+                        if (index != -1) schedules[index] = updatedTask
+
+                        // Send "update" command (using new protocol format)
+                        val taskJson = """{"id":"${updatedTask.id}","title":"${updatedTask.title}","port":${updatedTask.port},"start":"${updatedTask.startTime}","end":"${updatedTask.endTime}","active":${updatedTask.isActive},"alwaysOn":${updatedTask.alwaysActive}}"""
+                        sendCommandToEsp("""{"cmd":"update","task":$taskJson}""")
                     },
                     onEdit = { task ->
-                        taskToEdit = task
+                        taskToEdit = task // Set the task to be edited
                         showDialog = true
                     },
                     onDelete = { task ->
+                        Log.d(TAG, "Deleting task: $task")
+                        // In mock mode, remove locally.
                         schedules.remove(task)
-                        updateSchedulesOnEsp(schedules.toList())
+
+                        // Send "delete" command (using new protocol format)
+                        sendCommandToEsp("""{"cmd":"delete","id":"${task.id}"}""")
                     }
                 )
             }
 
+            // Show Edit/Add Dialog
             if (showDialog) {
                 TaskEditDialog(
-                    task = taskToEdit,
+                    task = taskToEdit, // Pass the task to edit, or null for new task
                     onDismiss = { showDialog = false },
                     onSave = { updatedTask ->
-                        if (taskToEdit == null) { // Add new
-                            schedules.add(updatedTask)
-                        } else { // Edit existing
+                        if (taskToEdit == null) { // Add new task
+                            Log.d(TAG, "Adding new task: $updatedTask")
+                            schedules.add(updatedTask) // Add locally in mock mode
+                            // Send "add" command
+                            val taskJson = """{"id":"${updatedTask.id}","title":"${updatedTask.title}","port":${updatedTask.port},"start":"${updatedTask.startTime}","end":"${updatedTask.endTime}","active":${updatedTask.isActive},"alwaysOn":${updatedTask.alwaysActive}}"""
+                            sendCommandToEsp("""{"cmd":"add","task":$taskJson}""")
+
+                        } else { // Edit existing task
+                            Log.d(TAG, "Updating task: $updatedTask")
                             val index = schedules.indexOfFirst { it.id == updatedTask.id }
                             if (index != -1) {
-                                schedules[index] = updatedTask
+                                schedules[index] = updatedTask // Update locally in mock mode
                             }
+                            // Send "update" command
+                            val taskJson = """{"id":"${updatedTask.id}","title":"${updatedTask.title}","port":${updatedTask.port},"start":"${updatedTask.startTime}","end":"${updatedTask.endTime}","active":${updatedTask.isActive},"alwaysOn":${updatedTask.alwaysActive}}"""
+                            sendCommandToEsp("""{"cmd":"update","task":$taskJson}""")
                         }
-                        updateSchedulesOnEsp(schedules.toList())
-                        showDialog = false
+                        showDialog = false // Close dialog after save
                     }
                 )
             }
@@ -206,6 +236,7 @@ fun ScheduleListView(
     }
 }
 
+// TaskCard UPDATED
 @Composable
 fun TaskCard(
     task: ScheduleTask,
@@ -219,8 +250,18 @@ fun TaskCard(
                 Switch(checked = task.isActive, onCheckedChange = { onToggle(task) })
                 Spacer(Modifier.width(16.dp))
                 Column(modifier = Modifier.weight(1.0f)) {
-                    Text("Port ${task.port}", fontWeight = FontWeight.Bold, fontSize = 20.sp)
-                    Text("Time: ${task.startTime} - ${task.endTime}", style = MaterialTheme.typography.bodyLarge)
+                    // Display Title
+                    Text(
+                        text = "Port ${task.port}: ${task.title}",
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 20.sp
+                    )
+                    // Display "Always ON" or time range
+                    val timeText = if (task.alwaysActive) "Always ON" else "${task.startTime} - ${task.endTime}"
+                    Text(
+                        text = "Time: $timeText",
+                        style = MaterialTheme.typography.bodyLarge
+                    )
                 }
                 IconButton(onClick = { onEdit(task) }) { Icon(Icons.Default.Edit, "Edit") }
                 IconButton(onClick = { onDelete(task) }) { Icon(Icons.Default.Delete, "Delete") }
@@ -229,24 +270,35 @@ fun TaskCard(
     }
 }
 
+// TaskEditDialog UPDATED
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun TaskEditDialog(
-    task: ScheduleTask?,
+    task: ScheduleTask?, // Null if adding a new task
     onDismiss: () -> Unit,
     onSave: (ScheduleTask) -> Unit
 ) {
     val context = LocalContext.current
-    var port by remember { mutableStateOf(task?.port?.toString() ?: "26") }
+    // State holders for the dialog fields
+    var title by remember { mutableStateOf(task?.title ?: "") }
+    var port by remember { mutableStateOf(task?.port?.toString() ?: "") } // Start empty for new task port
     var startTime by remember { mutableStateOf(task?.startTime ?: "09:00") }
     var endTime by remember { mutableStateOf(task?.endTime ?: "17:00") }
+    var alwaysActive by remember { mutableStateOf(task?.alwaysActive ?: false) }
 
+    // Function to show the Time Picker Dialog
     fun showTimePicker(isStartTime: Boolean) {
-        val (h, m) = if(isStartTime) startTime.split(":").map { it.toInt() } else endTime.split(":").map { it.toInt() }
+        val (h, m) = try { // Add try-catch for safety
+            val timeToParse = if (isStartTime) startTime else endTime
+            timeToParse.split(":").map { it.toInt() }
+        } catch (e: Exception) {
+            Log.w(TAG, "Error parsing time for picker: ${if (isStartTime) startTime else endTime}", e)
+            listOf(9, 0) // Default to 09:00 if parsing fails
+        }
         TimePickerDialog(context, { _, hour, minute ->
             val time = String.format("%02d:%02d", hour, minute)
             if (isStartTime) startTime = time else endTime = time
-        }, h, m, true).show()
+        }, h, m, true).show() // true for 24-hour format
     }
 
     AlertDialog(
@@ -254,25 +306,91 @@ fun TaskEditDialog(
         title = { Text(if (task == null) "Add Task" else "Edit Task") },
         text = {
             Column {
-                OutlinedTextField(value = port, onValueChange = { port = it }, label = { Text("GPIO Port Number") })
+                // Task Title Field
+                OutlinedTextField(
+                    value = title,
+                    onValueChange = { title = it },
+                    label = { Text("Task Title") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    isError = title.isBlank() // Basic validation feedback
+                )
                 Spacer(Modifier.height(8.dp))
+
+                // Port Number Field
+                OutlinedTextField(
+                    value = port,
+                    onValueChange = { port = it.filter { char -> char.isDigit() } }, // Only allow digits
+                    label = { Text("GPIO Port Number (0-48)") },
+                    modifier = Modifier.fillMaxWidth(),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), // Show number keyboard
+                    singleLine = true,
+                    isError = port.toIntOrNull() == null || (port.toIntOrNull() ?: -1) < 0 || (port.toIntOrNull() ?: -1) > 48 // Validation
+                )
+                Spacer(Modifier.height(16.dp))
+
+                // Always Active Checkbox
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    // Make the whole row clickable to toggle the checkbox
+                    modifier = Modifier.clickable { alwaysActive = !alwaysActive }.padding(vertical = 4.dp)
+                ) {
+                    Checkbox(checked = alwaysActive, onCheckedChange = { alwaysActive = it })
+                    Text("Always Active", modifier = Modifier.padding(start = 8.dp))
+                }
+                Spacer(Modifier.height(8.dp))
+
+                // Time Pickers (Disabled if Always Active)
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    OutlinedButton(onClick = { showTimePicker(true) }, modifier=Modifier.weight(1f)) { Text(startTime) }
+                    OutlinedButton(
+                        onClick = { showTimePicker(true) },
+                        modifier = Modifier.weight(1f),
+                        enabled = !alwaysActive // Disable if alwaysActive is true
+                    ) { Text(startTime) }
                     Text(" to ", modifier=Modifier.padding(horizontal=8.dp))
-                    OutlinedButton(onClick = { showTimePicker(false) }, modifier=Modifier.weight(1f)) { Text(endTime) }
+                    OutlinedButton(
+                        onClick = { showTimePicker(false) },
+                        modifier = Modifier.weight(1f),
+                        enabled = !alwaysActive // Disable if alwaysActive is true
+                    ) { Text(endTime) }
                 }
             }
         },
         confirmButton = {
             Button(onClick = {
-                val portNum = port.toIntOrNull() ?: 26
-                onSave(
-                    (task ?: ScheduleTask(port=0, startTime = "", endTime = "", isActive = true)).copy(
-                        port = portNum,
-                        startTime = startTime,
-                        endTime = endTime
-                    )
+                val portNum = port.toIntOrNull() ?: -1 // Use -1 to indicate invalid parse
+
+                // --- Validation ---
+                if (title.isBlank()) {
+                    Log.e(TAG, "Save failed: Title cannot be empty")
+                    // In a real app, show a Toast or Snackbar message to the user
+                    return@Button // Stop the save
+                }
+                if (portNum < 0 || portNum > 48) { // Check port range
+                    Log.e(TAG, "Save failed: Invalid port number '$port'. Must be 0-48.")
+                    // In a real app, show a Toast or Snackbar message to the user
+                    return@Button // Stop the save
+                }
+                // Optional: Add time validation (e.g., end time after start time) if needed
+
+                // Create or update the ScheduleTask object
+                val resultTask = (task ?: ScheduleTask( // If task is null, create new one
+                    id = UUID.randomUUID().toString(), // Generate new ID
+                    title = "", // Placeholder, will be overwritten by copy
+                    port = 0, // Placeholder
+                    startTime = "", // Placeholder
+                    endTime = "", // Placeholder
+                    isActive = true, // Default new tasks to active
+                    alwaysActive = false // Placeholder
+                )).copy(
+                    title = title.trim(), // Trim whitespace from title
+                    port = portNum,
+                    startTime = startTime,
+                    endTime = endTime,
+                    alwaysActive = alwaysActive
+                    // isActive state is preserved from original task, or defaults to true for new
                 )
+                onSave(resultTask) // Pass the validated and updated/created task back
             }) { Text("Save") }
         },
         dismissButton = {
@@ -282,11 +400,10 @@ fun TaskEditDialog(
 }
 
 
-// ---- Permissions Handling (UPDATED) ----
+// ---- Permissions Handling (Using Accompanist) ----
 @OptIn(ExperimentalPermissionsApi::class)
 @Composable
 fun RequestBluetoothPermissions(content: @Composable () -> Unit) {
-    // List of permissions to request
     val permissionsToRequest = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
         // Android 12 (API 31) and above
         listOf(
@@ -294,11 +411,11 @@ fun RequestBluetoothPermissions(content: @Composable () -> Unit) {
             Manifest.permission.BLUETOOTH_CONNECT
         )
     } else {
-        // Android 11 (API 30) and below
+        // Below Android 12
         listOf(
             Manifest.permission.BLUETOOTH,
             Manifest.permission.BLUETOOTH_ADMIN,
-            Manifest.permission.ACCESS_FINE_LOCATION
+            Manifest.permission.ACCESS_FINE_LOCATION // Needed for scanning below Android 12
         )
     }
 
@@ -307,26 +424,28 @@ fun RequestBluetoothPermissions(content: @Composable () -> Unit) {
     )
 
     if (permissionsState.allPermissionsGranted) {
-        content()
+        content() // Permissions granted, show the main app content
     } else {
+        // Permissions not granted, show the request UI
         Column(
             modifier = Modifier.padding(16.dp).fillMaxSize(),
             verticalArrangement = Arrangement.Center,
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             val textToShow = if (permissionsState.shouldShowRationale) {
-                // If the user has denied the permission but not permanently
-                "Bluetooth permissions are required for this app to scan for and connect to your ESP32."
+                // If the user previously denied the permission, explain why it's needed.
+                "Bluetooth permissions are crucial for this app to find and connect to your ESP32 device. Please grant the permissions."
             } else {
-                // First time asking or user denied permanently
-                "Bluetooth and Location permissions are required for BLE functionality."
+                // First time asking or user previously denied with "Don't ask again".
+                "This app requires Bluetooth permissions to function. Please grant them when prompted."
             }
 
-            Text(textToShow)
-            Spacer(modifier = Modifier.height(8.dp))
+            Text(textToShow, textAlign = TextAlign.Center) // Center align text
+            Spacer(modifier = Modifier.height(16.dp)) // Increased spacing
             Button(onClick = { permissionsState.launchMultiplePermissionRequest() }) {
                 Text("Request Permissions")
             }
         }
     }
 }
+

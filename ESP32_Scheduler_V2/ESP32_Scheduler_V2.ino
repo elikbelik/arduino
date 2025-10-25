@@ -1,191 +1,380 @@
-/*
-  ESP32 Port Scheduler Firmware - V2 (Offline, Multi-Task)
-  - Stores a list of schedules.
-  - Syncs time and schedule list with a phone over BLE.
-  - The ESP32 is the single source of truth for the schedule list.
-*/
+/**
+ * ESP32 Scheduler - V4
+ *
+ * This version adds:
+ * - A robust command-based system (add, update, delete, get_schedules, time_sync).
+ * - Fixes the WDT (Watchdog Timer) boot loop by moving all logic out of the main loop().
+ * - Adds "title" and "alwaysActive" fields to each task.
+ * - Adds detailed Serial.print() logs for all actions.
+ * - Adds forward declarations to fix compile errors.
+ */
 
 #include <BLEDevice.h>
-#include <BLEUtils.h>
 #include <BLEServer.h>
-#include <ArduinoJson.h>
-#include "time.h"
+#include <BLEUtils.h>
 #include <BLE2902.h>
+#include <ArduinoJson.h>
+#include <time.h> // For timekeeping
 
-// --- Configuration ---
+// --- BLE Configuration ---
 #define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
 #define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 
-#define MAX_SCHEDULES 20
-#define JSON_DOC_SIZE 1024 // Increased size for full schedule list
+BLECharacteristic* pCharacteristic;
+bool deviceConnected = false;
+bool timeIsSet = false;
 
-// Data structure for a single schedule task
-struct Schedule {
+// --- Schedule Configuration ---
+#define MAX_TASKS 20
+struct ScheduleTask {
+  char id[37]; // 36 chars for UUID + 1 for null terminator
+  char title[31]; // 30 chars for title
   int port;
-  bool active;
-  int startMinutes;
-  int endMinutes;
+  char startTime[6]; // "HH:MM"
+  char endTime[6];
+  bool isActive;
+  bool alwaysActive;
+};
+ScheduleTask schedules[MAX_TASKS];
+int taskCount = 0;
+
+// --- Forward Declarations ---
+// Fix for "'function' was not declared in this scope" error
+void sendSchedulesToApp();
+String getLocalTimeISO();
+String getCurrentTimeStr();
+void checkSchedules();
+
+
+// --- Server Callback Class ---
+class MyServerCallbacks: public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) {
+    deviceConnected = true;
+    Serial.println("Device connected");
+  }
+
+  void onDisconnect(BLEServer* pServer) {
+    deviceConnected = false;
+    timeIsSet = false; // Require a new time sync on reconnect
+    Serial.println("Device disconnected");
+    BLEDevice::startAdvertising(); // Restart advertising
+  }
 };
 
-// The global list of all schedules
-Schedule scheduleList[MAX_SCHEDULES];
-int scheduleCount = 0;
-bool isTimeSet = false;
+// --- Characteristic Callback Class ---
+class MyCallbacks: public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* pCharacteristic) {
+    String value = pCharacteristic->getValue();
+    Serial.println("--- New Command Received ---");
+    Serial.println(value);
 
-BLECharacteristic *pCharacteristic;
+    // Parse the command with ArduinoJson
+    JsonDocument doc;
+    DeserializationError error = deserializeJson(doc, value);
+
+    if (error) {
+      Serial.print("deserializeJson() failed: ");
+      Serial.println(error.c_str());
+      return;
+    }
+
+    const char* cmd = doc["cmd"];
+    if (!cmd) {
+      Serial.println("Command parsing error: 'cmd' field missing.");
+      return;
+    }
+
+    // --- Command Router ---
+    if (strcmp(cmd, "time_sync") == 0) {
+      // 1. Time Sync Command
+      // {"cmd":"time_sync","time":1678886400}
+      long unixTime = doc["time"];
+      if (unixTime > 0) {
+        timeval tv;
+        tv.tv_sec = unixTime;
+        tv.tv_usec = 0;
+        settimeofday(&tv, NULL);
+        timeIsSet = true;
+        Serial.print("Time successfully synced. Current time: ");
+        Serial.println(getLocalTimeISO());
+      } else {
+        Serial.println("Failed to sync time, invalid timestamp.");
+      }
+
+    } else if (strcmp(cmd, "get_schedules") == 0) {
+      // 2. Get All Schedules Command
+      // {"cmd":"get_schedules"}
+      Serial.println("Received get_schedules command. Sending list...");
+      sendSchedulesToApp();
+
+    } else if (strcmp(cmd, "add") == 0) {
+      // 3. Add New Task Command
+      // {"cmd":"add","task":{...}}
+      if (taskCount >= MAX_TASKS) {
+        Serial.println("Cannot add task: list is full.");
+        return;
+      }
+      JsonObject task = doc["task"];
+      strlcpy(schedules[taskCount].id, task["id"], 37);
+      strlcpy(schedules[taskCount].title, task["title"], 31);
+      schedules[taskCount].port = task["port"];
+      strlcpy(schedules[taskCount].startTime, task["start"], 6);
+      strlcpy(schedules[taskCount].endTime, task["end"], 6);
+      schedules[taskCount].isActive = task["active"];
+      schedules[taskCount].alwaysActive = task["alwaysOn"];
+      
+      Serial.print("Adding task '");
+      Serial.print(schedules[taskCount].title);
+      Serial.println("'");
+
+      taskCount++;
+      sendSchedulesToApp(); // Send updated list back to confirm
+
+    } else if (strcmp(cmd, "update") == 0) {
+      // 4. Update Existing Task Command
+      // {"cmd":"update","task":{...}}
+      JsonObject task = doc["task"];
+      const char* id = task["id"];
+      bool found = false;
+      for (int i = 0; i < taskCount; i++) {
+        if (strcmp(schedules[i].id, id) == 0) {
+          strlcpy(schedules[i].title, task["title"], 31);
+          schedules[i].port = task["port"];
+          strlcpy(schedules[i].startTime, task["start"], 6);
+          strlcpy(schedules[i].endTime, task["end"], 6);
+          schedules[i].isActive = task["active"];
+          schedules[i].alwaysActive = task["alwaysOn"];
+          
+          Serial.print("Updating task '");
+          Serial.print(schedules[i].title);
+          Serial.println("'");
+          
+          found = true;
+          break;
+        }
+      }
+      if (found) {
+        sendSchedulesToApp(); // Send updated list back
+      } else {
+        Serial.print("Could not update task, ID not found: ");
+        Serial.println(id);
+      }
+
+    } else if (strcmp(cmd, "delete") == 0) {
+      // 5. Delete Task Command
+      // {"cmd":"delete","id":"uuid-string"}
+      const char* id = doc["id"];
+      int foundIndex = -1;
+      for (int i = 0; i < taskCount; i++) {
+        if (strcmp(schedules[i].id, id) == 0) {
+          foundIndex = i;
+          Serial.print("Deleting task '");
+          Serial.print(schedules[i].title);
+          Serial.println("'");
+          break;
+        }
+      }
+
+      if (foundIndex != -1) {
+        // Shift all subsequent tasks down
+        for (int i = foundIndex; i < taskCount - 1; i++) {
+          schedules[i] = schedules[i + 1];
+        }
+        taskCount--;
+        sendSchedulesToApp(); // Send updated list back
+      } else {
+        Serial.print("Could not delete task, ID not found: ");
+        Serial.println(id);
+      }
+
+    } else {
+      Serial.print("Unknown command received: ");
+      Serial.println(cmd);
+    }
+
+    Serial.println("--- Command Processing Finished ---");
+  }
+};
 
 // --- Helper Functions ---
-void serializeSchedulesToJson(char* buffer, size_t size) {
-  StaticJsonDocument<JSON_DOC_SIZE> doc;
-  JsonArray schedules = doc.createNestedArray("schedules");
-  
-  for (int i = 0; i < scheduleCount; i++) {
-    JsonObject s = schedules.createNestedObject();
-    s["port"] = scheduleList[i].port;
-    s["active"] = scheduleList[i].active;
-    
-    char startTime[6], endTime[6];
-    sprintf(startTime, "%02d:%02d", scheduleList[i].startMinutes / 60, scheduleList[i].startMinutes % 60);
-    sprintf(endTime, "%02d:%02d", scheduleList[i].endMinutes / 60, scheduleList[i].endMinutes % 60);
-    s["start"] = startTime;
-    s["end"] = endTime;
+
+String getLocalTimeISO() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    return "Time not set";
   }
-  
-  serializeJson(doc, buffer, size);
+  char timeStr[20];
+  strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", &timeinfo);
+  return String(timeStr);
 }
 
+// Gets current time as "HH:MM"
+String getCurrentTimeStr() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    return "00:00";
+  }
+  char timeStr[6];
+  strftime(timeStr, sizeof(timeStr), "%H:%M", &timeinfo);
+  return String(timeStr);
+}
 
-// --- BLE Callbacks ---
-class MyCallbacks: public BLECharacteristicCallbacks {
-    void onWrite(BLECharacteristic *pCharacteristic) {
-      String value = pCharacteristic->getValue();
-      if (value.length() == 0) return;
+// Sends the full list of schedules to the app
+void sendSchedulesToApp() {
+  if (!deviceConnected) {
+    Serial.println("Send failed: Device not connected.");
+    return;
+  }
 
-      Serial.print("Received Command: ");
-      Serial.println(value.c_str());
+  JsonDocument doc;
+  JsonArray tasks = doc.to<JsonArray>();
+  for (int i = 0; i < taskCount; i++) {
+    JsonObject task = tasks.add<JsonObject>();
+    task["id"] = schedules[i].id;
+    task["title"] = schedules[i].title;
+    task["port"] = schedules[i].port;
+    task["start"] = schedules[i].startTime;
+    task["end"] = schedules[i].endTime;
+    task["active"] = schedules[i].isActive;
+    task["alwaysOn"] = schedules[i].alwaysActive;
+  }
 
-      StaticJsonDocument<JSON_DOC_SIZE> doc;
-      deserializeJson(doc, value);
+  String output;
+  serializeJson(doc, output);
 
-      // --- Time Sync Command ---
-      if (doc.containsKey("time")) {
-        timeval tv;
-        tv.tv_sec = doc["time"];
-        settimeofday(&tv, NULL);
-        isTimeSet = true;
-        Serial.println("Time has been synchronized.");
+  Serial.println("Sending schedule list to app:");
+  Serial.println(output);
+
+  // Send the JSON string to the app
+  pCharacteristic->setValue(output.c_str());
+  pCharacteristic->notify();
+}
+
+// This function checks and applies the schedules
+void checkSchedules() {
+  if (!timeIsSet) {
+    // Don't do anything if time hasn't been synced
+    return;
+  }
+
+  String currentTime = getCurrentTimeStr();
+  // Serial.print("Checking schedules... Current time: "); // Uncomment for very noisy logging
+  // Serial.println(currentTime);
+
+  for (int i = 0; i < taskCount; i++) {
+    ScheduleTask task = schedules[i];
+
+    // Configure the pin as an output
+    // Note: Do not use input-only pins (34-39) or system pins (6-11)!
+    pinMode(task.port, OUTPUT);
+
+    if (!task.isActive) {
+      // Task is disabled, turn it off
+      if (digitalRead(task.port) == HIGH) { // Only log if state is changing
+        Serial.print("Task '");
+        Serial.print(task.title);
+        Serial.print("' (Port ");
+        Serial.print(task.port);
+        Serial.println(") is inactive. Turning OFF.");
+        digitalWrite(task.port, LOW);
       }
-      
-      // --- Command Router ---
-      const char* cmd = doc["cmd"];
-      if (!cmd) return;
+      continue;
+    }
 
-      // --- Get Schedules Command ---
-      if (strcmp(cmd, "get_schedules") == 0) {
-        char buffer[JSON_DOC_SIZE];
-        serializeSchedulesToJson(buffer, sizeof(buffer));
-        pCharacteristic->setValue(buffer);
-        pCharacteristic->notify(); // Notify the client the value has changed
-        Serial.println("Sent schedule list to phone.");
-        Serial.println(buffer);
+    if (task.alwaysActive) {
+      // Task is set to "Always Active", turn it on
+      if (digitalRead(task.port) == LOW) { // Only log if state is changing
+        Serial.print("Task '");
+        Serial.print(task.title);
+        Serial.print("' (Port ");
+        Serial.print(task.port);
+        Serial.println(") is 'Always Active'. Turning ON.");
+        digitalWrite(task.port, HIGH);
       }
-      
-      // --- Set Schedules Command ---
-      else if (strcmp(cmd, "set_schedules") == 0) {
-        JsonArray data = doc["data"];
-        scheduleCount = 0; // Clear the old list
-        
-        for (JsonObject item : data) {
-          if (scheduleCount >= MAX_SCHEDULES) break;
-          
-          scheduleList[scheduleCount].port = item["port"];
-          scheduleList[scheduleCount].active = item["active"];
-          
-          const char* start_str = item["start"];
-          const char* end_str = item["end"];
-          int startH, startM, endH, endM;
-          sscanf(start_str, "%d:%d", &startH, &startM);
-          sscanf(end_str, "%d:%d", &endH, &endM);
-          
-          scheduleList[scheduleCount].startMinutes = startH * 60 + startM;
-          scheduleList[scheduleCount].endMinutes = endH * 60 + endM;
-          
-          scheduleCount++;
-        }
-        Serial.printf("Received and saved %d schedules.\n", scheduleCount);
+      continue;
+    }
+
+    // Standard time-based logic
+    bool shouldBeOn = false;
+    if (strcmp(task.startTime, task.endTime) < 0) {
+      // Normal case (e.g., 09:00 - 17:00)
+      shouldBeOn = (currentTime >= task.startTime && currentTime < task.endTime);
+    } else {
+      // Overnight case (e.g., 22:00 - 06:00)
+      shouldBeOn = (currentTime >= task.startTime || currentTime < task.endTime);
+    }
+
+    if (shouldBeOn) {
+      if (digitalRead(task.port) == LOW) { // Only log if state is changing
+        Serial.print("Task '");
+        Serial.print(task.title);
+        Serial.print("' (Port ");
+        Serial.print(task.port);
+        Serial.println(") is ACTIVE. Turning ON.");
+        digitalWrite(task.port, HIGH);
+      }
+    } else {
+      if (digitalRead(task.port) == HIGH) { // Only log if state is changing
+        Serial.print("Task '");
+        Serial.print(task.title);
+        Serial.print("' (Port ");
+        Serial.print(task.port);
+        Serial.println(") is INACTIVE. Turning OFF.");
+        digitalWrite(task.port, LOW);
       }
     }
-};
+  }
+}
 
-
+// --- Arduino Setup ---
 void setup() {
   Serial.begin(115200);
-  Serial.println("Starting ESP32 Scheduler V2...");
-
-  // Initialize all possible ports you might use
-  pinMode(25, OUTPUT); pinMode(26, OUTPUT); pinMode(27, OUTPUT); pinMode(32, OUTPUT);
-  digitalWrite(25, LOW); digitalWrite(26, LOW); digitalWrite(27, LOW); digitalWrite(32, LOW);
+  Serial.println("Starting ESP32 Scheduler V4...");
 
   // Initialize BLE
-  BLEDevice::init("ESP32 Scheduler V2");
+  BLEDevice::init("ESP32 Scheduler");
   BLEServer *pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
   BLEService *pService = pServer->createService(SERVICE_UUID);
-  
+
   pCharacteristic = pService->createCharacteristic(
                       CHARACTERISTIC_UUID,
                       BLECharacteristic::PROPERTY_READ |
                       BLECharacteristic::PROPERTY_WRITE |
                       BLECharacteristic::PROPERTY_NOTIFY
                     );
+
   pCharacteristic->addDescriptor(new BLE2902());
   pCharacteristic->setCallbacks(new MyCallbacks());
+
+  // Set an initial value
+  pCharacteristic->setValue("Hello! Awaiting command...");
   pService->start();
-  
+
+  // Start advertising
   BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
   pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->setScanResponse(true);
+  pAdvertising->setMinPreferred(0x06); // functions that help with iPhone connections
+  pAdvertising->setMinPreferred(0x12);
   BLEDevice::startAdvertising();
-  Serial.println("BLE Server started.");
+
+  Serial.println("BLE Server started. Waiting for a client connection...");
 }
 
-void checkSchedules() {
-  if (!isTimeSet) return;
-
-  struct tm timeinfo;
-  getLocalTime(&timeinfo);
-  int currentMinutes = timeinfo.tm_hour * 60 + timeinfo.tm_min;
-
-  // Logic to determine which ports should be on
-  bool portState[34] = {false}; // Keep track of final port states
-
-  for (int i = 0; i < scheduleCount; i++) {
-    Schedule s = scheduleList[i];
-    if (!s.active) continue;
-
-    bool shouldBeOn = false;
-    if (s.startMinutes > s.endMinutes) { // Overnight
-      if (currentMinutes >= s.startMinutes || currentMinutes < s.endMinutes) {
-        shouldBeOn = true;
-      }
-    } else { // Same-day
-      if (currentMinutes >= s.startMinutes && currentMinutes < s.endMinutes) {
-        shouldBeOn = true;
-      }
-    }
-
-    if (shouldBeOn) {
-      portState[s.port] = true;
-    }
-  }
-
-  // Apply the final states to the GPIOs
-  // This correctly handles multiple schedules for the same port
-  for (int i=0; i<34; ++i) {
-    digitalWrite(i, portState[i]);
-  }
-}
-
+// --- Arduino Loop ---
 void loop() {
-  checkSchedules();
-  delay(5000);
+  // The main loop is now non-blocking!
+  // This loop runs thousands of times per second.
+  
+  if (deviceConnected && timeIsSet) {
+    // Only check schedules if a device is connected and time is synced
+    checkSchedules();
+  }
+
+  // A small delay is CRITICAL to prevent the watchdog timer from
+  // resetting the chip, especially when no device is connected.
+  // This allows background BLE tasks to run.
+  delay(100);
 }
 

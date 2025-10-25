@@ -57,6 +57,7 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.3")
     implementation("androidx.activity:activity-compose:1.9.0")
     implementation("androidx.core:core-splashscreen:1.0.1")
+    implementation("androidx.compose.ui:ui-text")
 
     // Jetpack Compose Libraries (Bill of Materials)
     val composeBom = platform("androidx.compose:compose-bom:2024.06.00")
