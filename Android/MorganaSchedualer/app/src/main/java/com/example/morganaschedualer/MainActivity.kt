@@ -196,6 +196,10 @@ fun SchedulerAppWithBleControl() {
     var showDialog by remember { mutableStateOf(false) }
     var taskToEdit by remember { mutableStateOf<ScheduleTask?>(null) }
     var showDeviceListDialog by remember { mutableStateOf(false) }
+    
+    // --- Chunk Reassembly ---
+    val chunks = remember { mutableMapOf<Int, String>() }
+    var expectedChunks by remember { mutableStateOf(0) }
 
     // --- Helper Functions ---
     // Function to enable notifications on the Characteristic
@@ -322,7 +326,9 @@ fun SchedulerAppWithBleControl() {
             // Check if JSON is complete (should start with '[' and end with ']')
             if (!jsonString.startsWith("[") || !jsonString.endsWith("]")) {
                 Log.e(TAG, "❌ JSON appears truncated! Start: ${jsonString.startsWith("[")} End: ${jsonString.endsWith("]")}")
-                Log.e(TAG, "   This usually means MTU is too small. Check MTU negotiation logs.")
+                Log.e(TAG, "   Received ${jsonString.length} bytes")
+                Log.e(TAG, "   First 100 chars: ${jsonString.take(100)}")
+                Log.e(TAG, "   Last 100 chars: ${jsonString.takeLast(100)}")
                 return
             }
             
@@ -371,13 +377,13 @@ fun SchedulerAppWithBleControl() {
                             BluetoothProfile.STATE_CONNECTED -> {
                                 connectionState = "Negotiating MTU..."
                                 bluetoothGatt = gatt
-                                // Request larger MTU to handle larger JSON payloads
-                                Log.i(TAG, "🔧 Requesting MTU of 517 bytes...")
-                                val mtuRequested = gatt?.requestMtu(517) // 512 bytes payload + 5 bytes overhead
+                                // Request maximum practical MTU (512 bytes = standard BLE maximum)
+                                Log.i(TAG, "🔧 Requesting MTU of 512 bytes (standard maximum)...")
+                                val mtuRequested = gatt?.requestMtu(512)
                                 if (mtuRequested == true) {
-                                    Log.d(TAG, "MTU request initiated successfully")
+                                    Log.d(TAG, "✅ MTU request initiated successfully")
                                 } else {
-                                    Log.e(TAG, "Failed to initiate MTU request")
+                                    Log.e(TAG, "❌ Failed to initiate MTU request")
                                     // Fall back to service discovery if MTU request fails
                                     delay(600)
                                     gatt?.discoverServices()
@@ -389,6 +395,8 @@ fun SchedulerAppWithBleControl() {
                                 bluetoothGatt = null
                                 characteristic = null
                                 schedules.clear() // Clear data on disconnect
+                                chunks.clear() // Clear any pending chunks
+                                expectedChunks = 0
                                 Log.d(TAG,"Disconnected from GATT server.")
                             }
                         }
@@ -469,11 +477,57 @@ fun SchedulerAppWithBleControl() {
             override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, value: ByteArray) {
                 scope.launch {
                     if (characteristic.uuid == CHARACTERISTIC_UUID) {
-                        val receivedJson = String(value, Charsets.UTF_8)
+                        val receivedData = String(value, Charsets.UTF_8)
                         Log.i(TAG, "📥 RECEIVED DATA from ESP32:")
-                        Log.i(TAG, "   Length: ${receivedJson.length} bytes")
-                        Log.i(TAG, "   Content: $receivedJson")
-                        parseAndLoadSchedules(receivedJson, schedules)
+                        Log.i(TAG, "   Length: ${receivedData.length} bytes")
+                        
+                        // Check if this is a chunked message: [chunk_index/total_chunks]data
+                        val chunkPattern = Regex("^\\[(\\d+)/(\\d+)\\](.*)$", RegexOption.DOT_MATCHES_ALL)
+                        val match = chunkPattern.find(receivedData)
+                        
+                        if (match != null) {
+                            // Chunked data
+                            val chunkIndex = match.groupValues[1].toInt()
+                            val totalChunks = match.groupValues[2].toInt()
+                            val chunkData = match.groupValues[3]
+                            
+                            Log.i(TAG, "   📦 Chunk ${chunkIndex + 1}/$totalChunks (${chunkData.length} bytes)")
+                            
+                            chunks[chunkIndex] = chunkData
+                            expectedChunks = totalChunks
+                            
+                            // Check if we have all chunks
+                            if (chunks.size == totalChunks) {
+                                Log.i(TAG, "   ✅ All $totalChunks chunks received, reassembling...")
+                                
+                                // Reassemble in order
+                                val completeJson = StringBuilder()
+                                for (i in 0 until totalChunks) {
+                                    completeJson.append(chunks[i] ?: "")
+                                }
+                                
+                                val finalJson = completeJson.toString()
+                                Log.i(TAG, "   📋 Complete JSON: ${finalJson.length} bytes")
+                                
+                                // Clear for next time
+                                chunks.clear()
+                                expectedChunks = 0
+                                
+                                // Parse the complete JSON
+                                parseAndLoadSchedules(finalJson, schedules)
+                            } else {
+                                Log.i(TAG, "   ⏳ Waiting for more chunks (${chunks.size}/$totalChunks)")
+                            }
+                        } else {
+                            // Not chunked - direct JSON array
+                            Log.d(TAG, "   Content (first 200 chars): ${receivedData.take(200)}")
+                            
+                            if (receivedData.trim().startsWith("[")) {
+                                parseAndLoadSchedules(receivedData, schedules)
+                            } else {
+                                Log.w(TAG, "   ⚠️ Received non-array data (ignoring): ${receivedData.take(100)}")
+                            }
+                        }
                     }
                 }
             }
@@ -682,8 +736,21 @@ fun SchedulerAppWithBleControl() {
                             Log.d(TAG, "UI Delete: $task")
                             // Update locally immediately
                             schedules.remove(task)
-                            // Send delete command to ESP32
-                            sendCommandToEsp("""{"cmd":"delete","id":"${task.id}"}""")
+                            // First deactivate the task to reset the pin
+                            if (task.isActive) {
+                                Log.d(TAG, "Deactivating task before delete to reset pin")
+                                val deactivatedTask = task.copy(isActive = false)
+                                val taskJson = """{"id":"${deactivatedTask.id}","title":"${deactivatedTask.title}","port":${deactivatedTask.port},"start":"${deactivatedTask.startTime}","end":"${deactivatedTask.endTime}","active":false,"alwaysOn":${deactivatedTask.alwaysActive}}"""
+                                sendCommandToEsp("""{"cmd":"update","task":$taskJson}""")
+                                // Wait a bit before sending delete
+                                scope.launch {
+                                    delay(200)
+                                    sendCommandToEsp("""{"cmd":"delete","id":"${task.id}"}""")
+                                }
+                            } else {
+                                // Task already inactive, just delete
+                                sendCommandToEsp("""{"cmd":"delete","id":"${task.id}"}""")
+                            }
                         }
                     )
                 }
@@ -981,18 +1048,24 @@ fun TaskEditDialog(
                     Text("Always Active", modifier = Modifier.padding(start = 8.dp))
                 }
                 Spacer(Modifier.height(8.dp))
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    OutlinedButton(
-                        onClick = { showTimePicker(true) },
-                        modifier = Modifier.weight(1f),
-                        enabled = !alwaysActive
-                    ) { Text(startTime) }
-                    Text(" to ", modifier = Modifier.padding(horizontal = 8.dp))
-                    OutlinedButton(
-                        onClick = { showTimePicker(false) },
-                        modifier = Modifier.weight(1f),
-                        enabled = !alwaysActive
-                    ) { Text(endTime) }
+                Column {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("From:", modifier = Modifier.width(60.dp))
+                        OutlinedButton(
+                            onClick = { showTimePicker(true) },
+                            modifier = Modifier.weight(1f),
+                            enabled = !alwaysActive
+                        ) { Text(startTime) }
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("To:", modifier = Modifier.width(60.dp))
+                        OutlinedButton(
+                            onClick = { showTimePicker(false) },
+                            modifier = Modifier.weight(1f),
+                            enabled = !alwaysActive
+                        ) { Text(endTime) }
+                    }
                 }
             }
         },

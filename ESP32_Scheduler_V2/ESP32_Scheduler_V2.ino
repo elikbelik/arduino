@@ -1,14 +1,18 @@
 /**
- * ESP32 Scheduler - V5
+ * ESP32 Scheduler - V6
  *
  * This version adds:
  * - Persistent storage using Preferences library (tasks survive reboots)
  * - Enhanced debugging for all BLE communication
- * - A robust command-based system (add, update, delete, get_schedules, time_sync).
- * - Fixes the WDT (Watchdog Timer) boot loop by moving all logic out of the main loop().
- * - Adds "title" and "alwaysActive" fields to each task.
- * - Adds detailed Serial.print() logs for all actions.
- * - Adds forward declarations to fix compile errors.
+ * - A robust command-based system (add, update, delete, get_schedules, time_sync)
+ * - Fixes the WDT (Watchdog Timer) boot loop by moving all logic out of the main loop()
+ * - Adds "title" and "alwaysActive" fields to each task
+ * - Adds detailed Serial.print() logs for all actions
+ * - Adds forward declarations to fix compile errors
+ * - MTU set to 512 bytes (standard BLE maximum for compatibility)
+ * - Critical timing fix: 100ms delays before sending responses to prevent data corruption
+ * - AUTOMATIC CHUNKING: Transparently splits large responses (>450 bytes) into multiple notifications
+ *   Format: [chunk_index/total_chunks]data - supports 100+ tasks seamlessly
  */
 
 #include <BLEDevice.h>
@@ -62,7 +66,7 @@ class MyServerCallbacks: public BLEServerCallbacks {
     Serial.println(">>> BLE DEVICE CONNECTED <<<");
     Serial.print(">>> Current taskCount: ");
     Serial.println(taskCount);
-    Serial.println(">>> MTU: 517 bytes configured for large transfers");
+    Serial.println(">>> MTU: 512 bytes (standard maximum)");
     Serial.println(">>> Waiting for commands from app...");
     Serial.println("===========================================");
   }
@@ -150,6 +154,7 @@ class MyCallbacks: public BLECharacteristicCallbacks {
       Serial.println(">>> Processing get_schedules command...");
       Serial.print(">>> Current taskCount: ");
       Serial.println(taskCount);
+      delay(100); // Small delay to ensure write operation completes
       sendSchedulesToApp();
 
     } else if (strcmp(cmd, "add") == 0) {
@@ -179,6 +184,7 @@ class MyCallbacks: public BLECharacteristicCallbacks {
 
       taskCount++;
       saveSchedules(); // Save to flash memory
+      delay(100); // Small delay before sending response
       sendSchedulesToApp(); // Send updated list back to confirm
 
     } else if (strcmp(cmd, "update") == 0) {
@@ -209,6 +215,7 @@ class MyCallbacks: public BLECharacteristicCallbacks {
       }
       if (found) {
         saveSchedules(); // Save to flash memory
+        delay(100); // Small delay before sending response
         sendSchedulesToApp(); // Send updated list back
       } else {
         Serial.print(">>> ERROR: Could not update task, ID not found: ");
@@ -239,6 +246,7 @@ class MyCallbacks: public BLECharacteristicCallbacks {
         }
         taskCount--;
         saveSchedules(); // Save to flash memory
+        delay(100); // Small delay before sending response
         sendSchedulesToApp(); // Send updated list back
         Serial.print(">>> Task deleted. New taskCount: ");
         Serial.println(taskCount);
@@ -279,7 +287,7 @@ String getCurrentTimeStr() {
   return String(timeStr);
 }
 
-// Sends the full list of schedules to the app
+// Sends the full list of schedules to the app with automatic chunking
 void sendSchedulesToApp() {
   if (!deviceConnected) {
     Serial.println(">>> ERROR: Send failed - Device not connected.");
@@ -321,11 +329,45 @@ void sendSchedulesToApp() {
   Serial.print(output.length());
   Serial.println(" bytes");
 
-  // Send the JSON string to the app
-  pCharacteristic->setValue(output.c_str());
-  pCharacteristic->notify();
+  // Split into chunks if needed (max 450 bytes per chunk for safety)
+  const int CHUNK_SIZE = 450;
+  int dataLen = output.length();
+  int numChunks = (dataLen + CHUNK_SIZE - 1) / CHUNK_SIZE;
   
-  Serial.println(">>> Schedule list sent via BLE notification");
+  if (numChunks == 1) {
+    // Small enough - send directly
+    Serial.println(">>> Sending in single notification");
+    pCharacteristic->setValue(output.c_str());
+    pCharacteristic->notify();
+  } else {
+    // Need multiple chunks
+    Serial.print(">>> Splitting into ");
+    Serial.print(numChunks);
+    Serial.println(" chunks");
+    
+    for (int i = 0; i < numChunks; i++) {
+      int start = i * CHUNK_SIZE;
+      int end = min(start + CHUNK_SIZE, dataLen);
+      String chunk = output.substring(start, end);
+      
+      // Format: [chunk_index/total_chunks]data
+      String packet = "[" + String(i) + "/" + String(numChunks) + "]" + chunk;
+      
+      Serial.print(">>> Chunk ");
+      Serial.print(i + 1);
+      Serial.print("/");
+      Serial.print(numChunks);
+      Serial.print(" (");
+      Serial.print(packet.length());
+      Serial.println(" bytes)");
+      
+      pCharacteristic->setValue(packet.c_str());
+      pCharacteristic->notify();
+      delay(50); // Small delay between chunks
+    }
+    
+    Serial.println(">>> ✅ All chunks sent");
+  }
 }
 
 // Save all schedules to flash memory (persistent storage)
@@ -473,7 +515,8 @@ void setup() {
   Serial.begin(115200);
   Serial.println();
   Serial.println("===========================================");
-  Serial.println(">>> Starting ESP32 Scheduler V5 <<<");
+  Serial.println(">>> Starting ESP32 Scheduler V6 <<<");
+  Serial.println(">>> Features: Auto-chunking, 100+ tasks");
   Serial.println("===========================================");
 
   // Load saved schedules from flash memory
@@ -485,8 +528,9 @@ void setup() {
   BLEDevice::init("ESP32 Scheduler");
   
   // Set MTU size (must be done before creating server)
-  BLEDevice::setMTU(517); // Set maximum MTU to match Android request
-  Serial.println(">>> MTU set to 517 bytes for large data transfers");
+  // 512 is the practical maximum supported by most BLE devices
+  BLEDevice::setMTU(512); // Standard maximum MTU
+  Serial.println(">>> MTU set to 512 bytes (standard maximum)");
   
   BLEServer *pServer = BLEDevice::createServer();
   pServer->setCallbacks(new MyServerCallbacks());
