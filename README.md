@@ -8,7 +8,7 @@ Just follow these simple steps.
 
 ### Step 1: Download the File
 
-1.  On your Android phone, download the `MorganaSchedualer.apk` file.
+1.  On your Android phone, download the latest [`MorganaSchedualer.apk`](https://github.com/elikbelik/arduino/releases/download/v1.0/MorganaSchedualer.apk) file.
 
 ### Step 2: Open the File
 
